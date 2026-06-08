@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Firebase local cache
+.firebase/
+
+# Environment variables (keep example, ignore real values)
+.env
+.env.*
+!.env.example
+
+# Editor / tooling
+.vscode/
+.claude/
+
+# Local files
+*.local
+
+# OS
+.DS_Store
+Thumbs.db

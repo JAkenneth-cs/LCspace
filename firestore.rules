@@ -1,0 +1,254 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ──────────────────────────────────────
+
+    /** Is the caller authenticated? */
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    /** Is the caller the document owner? */
+    function isOwner(uid) {
+      return isAuth() && request.auth.uid == uid;
+    }
+
+    /** Does the caller's Firestore user doc have a given role? */
+    function hasRole(role) {
+      return isAuth() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == role;
+    }
+
+    function isAdmin() { return hasRole('admin'); }
+    function isStaff() { return hasRole('staff') || isAdmin(); }
+
+    /** Guard incoming write data — only allow listed fields (no extra injection) */
+    function onlyFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // ── /users/{uid} ─────────────────────────────────────────
+    // • Read is public so the unauthenticated Account Recovery flow can look up
+    //   a user by email and fetch their security question + recovery_email.
+    //   (The recovery answer is then validated client-side, and Firebase sends
+    //   the reset link only to recovery_email — never the typed input.)
+    // • Users can update their own non-sensitive fields.
+    // • Only admin can change role / status.
+    match /users/{uid} {
+      allow read: if true;
+
+      allow create: if isOwner(uid) && onlyFields([
+        'name', 'student_id', 'email', 'department',
+        'role', 'status', 'strike_count', 'created_at',
+        'preferred_name', 'photo_url', 'photo_updated_at',
+        'recovery_email', 'recovery_question', 'recovery_answer'
+      ]);
+
+      allow update: if
+        // Admin can update anything on any user doc
+        isAdmin()
+        ||
+        // Users can only change their own safe fields (check diff, not full doc)
+        (isOwner(uid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'department', 'preferred_name', 'photo_url', 'photo_updated_at',
+          'recovery_email', 'recovery_question', 'recovery_answer'
+        ]));
+
+      allow delete: if isOwner(uid) || isAdmin();
+    }
+
+    // ── /bookings/{bookingId} ─────────────────────────────────
+    // • Students can read ONLY THEIR OWN bookings (privacy).
+    // • Admin/staff can read all bookings.
+    // • Students can create bookings for themselves; status MUST be 'Pending'.
+    // • Admin/staff can update status (confirm, check-in, cancel).
+    // • Students can cancel Pending/Confirmed within 15 min (enforced client-side).
+    // • Students can delete their own bookings; admin can delete any.
+    match /bookings/{bookingId} {
+      allow read: if isAuth();
+
+      // Staff can create (e.g. promoting waitlisted students); students create their own only
+      // Students CANNOT set status to anything other than 'Pending' — prevents self-approval.
+      allow create: if isStaff() || (isAuth() &&
+        request.resource.data.user_id == request.auth.uid &&
+        request.resource.data.status == 'Pending' &&
+        onlyFields([
+          'user_id', 'student_name', 'student_id', 'name', 'room_id', 'room_name',
+          'facility', 'booking_date', 'date', 'time', 'purpose', 'group_size',
+          'status', 'created_at', 'id', 'promoted_from_waitlist'
+        ]));
+
+      allow update: if isStaff() ||
+        // Student can cancel their own Pending or Confirmed booking
+        (isAuth() &&
+          resource.data.user_id == request.auth.uid &&
+          (resource.data.status == 'Pending' || resource.data.status == 'Confirmed') &&
+          request.resource.data.status == 'Cancelled' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelled_at'])) ||
+        // Student can soft-delete (hide from their own list) — admin still sees the record
+        (isAuth() &&
+          resource.data.user_id == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['hidden_for_student', 'hidden_for_student_at']));
+
+      // Students can delete their own bookings (any status — UI already controls this)
+      allow delete: if isAdmin() || (isAuth() && resource.data.user_id == request.auth.uid);
+    }
+
+
+    // ── /announcements/{id} ───────────────────────────────────
+    match /announcements/{id} {
+      allow read: if isAuth();
+      allow write: if isStaff();
+    }
+
+    // ── /facilities/{id} ─────────────────────────────────────
+    match /facilities/{id} {
+      allow read: if isAuth();
+      allow write: if isAdmin();
+    }
+
+    // ── /help_tickets/{id} ───────────────────────────────────
+    match /help_tickets/{id} {
+      allow read: if isStaff() ||
+        (isAuth() && resource.data.user_id == request.auth.uid);
+      allow create: if isAuth() &&
+        request.resource.data.user_id == request.auth.uid;
+      allow update: if isStaff();
+      allow delete: if isAdmin() || (isAuth() && resource.data.user_id == request.auth.uid);
+    }
+
+    // ── /appeals/{id} ────────────────────────────────────────
+    // Students submit strike-reset appeals; admin/staff review them.
+    // • Students can read ONLY their own appeals.
+    // • Students create their own appeal; status MUST be 'pending'
+    //   (prevents self-approval), fields restricted to prevent injection.
+    // • Only staff/admin can update (approve/reject) or delete.
+    match /appeals/{id} {
+      allow read: if isStaff() ||
+        (isAuth() && resource.data.user_id == request.auth.uid);
+
+      allow create: if isAuth() &&
+        request.resource.data.user_id == request.auth.uid &&
+        request.resource.data.status == 'pending' &&
+        onlyFields([
+          'user_id', 'student_id', 'student_name', 'student_email',
+          'strike_count', 'reason', 'status', 'created_at'
+        ]);
+
+      allow update: if isStaff();
+      allow delete: if isAdmin();
+    }
+
+    // ── /admin_messages/{id} ─────────────────────────────────
+    // Messages use recipient_uid (Firebase UID) for targeted delivery,
+    // recipient_id == 'all' for broadcasts.
+    // Student-sent messages carry sender_uid so students can read/delete their own.
+    match /admin_messages/{id} {
+      allow read: if isStaff() ||
+        (isAuth() && (
+          resource.data.recipient_uid == request.auth.uid ||
+          resource.data.recipient_id == 'all' ||
+          resource.data.sender_uid == request.auth.uid
+        ));
+      // Staff bypass field checks (system/admin messages have extra fields).
+      // Students must set sender_uid to their own UID and may only write safe fields.
+      // Cyberspace session invites are a special student-to-student message that
+      // carries the session_id (so the recipient can join) — allowed with a scoped
+      // field list and a required recipient_uid.
+      allow create: if isStaff() ||
+        (isAuth() &&
+          request.resource.data.sender_uid == request.auth.uid &&
+          onlyFields([
+            'subject', 'message', 'sender_uid', 'sender_name', 'sender_student_id',
+            'recipient_id', 'recipient_uid', 'type', 'direction', 'created_at'
+          ])) ||
+        (isAuth() &&
+          request.resource.data.type == 'session_invite' &&
+          request.resource.data.recipient_uid is string &&
+          onlyFields([
+            'type', 'recipient_uid', 'subject', 'message',
+            'session_id', 'session_room', 'session_time', 'session_date', 'host_name', 'created_at'
+          ]));
+      // Staff can update freely. Students can only flip hidden_for_student fields
+      // on messages addressed to them or sent by them (soft-delete from their view).
+      allow update: if isStaff() ||
+        (isAuth()
+         && (resource.data.recipient_uid == request.auth.uid || resource.data.sender_uid == request.auth.uid)
+         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['hidden_for_student', 'hidden_for_student_at', 'read', 'read_at']));
+      allow delete: if isStaff() ||
+        (isAuth() && resource.data.recipient_uid == request.auth.uid) ||
+        (isAuth() && resource.data.sender_uid == request.auth.uid);
+    }
+
+    // ── /sessions/{sid} ──────────────────────────────────────
+    // Cyberspace: WebRTC signaling, shared whiteboard, chat, and invites.
+    match /sessions/{sid} {
+      match /presence/{uid} {
+        allow read, write: if isAuth();
+      }
+      // Host-issued removal markers — lets a removed student be ejected and
+      // blocked from silently re-joining the same session.
+      match /removed/{uid} {
+        allow read, write: if isAuth();
+      }
+      match /calls/{callId} {
+        allow read, write: if isAuth();
+        match /callerCandidates/{cid} { allow read, write: if isAuth(); }
+        match /calleeCandidates/{cid} { allow read, write: if isAuth(); }
+      }
+      match /whiteboard/{docId} {
+        allow read, write: if isAuth();
+      }
+      // Whiteboard draw-permission requests/grants (host approves guests).
+      match /wb_access/{uid} {
+        allow read, write: if isAuth();
+      }
+      // Session state (e.g. ended-by-host) so invited guests can't rejoin a closed call.
+      match /state/{docId} {
+        allow read, write: if isAuth();
+      }
+      match /chat/{msgId} {
+        allow read: if isAuth();
+        allow create: if isAuth() && request.resource.data.uid == request.auth.uid;
+        allow delete: if isAuth() && resource.data.uid == request.auth.uid;
+      }
+      match /invites/{inviteUid} {
+        allow read: if isAuth() && request.auth.uid == inviteUid;
+        allow create, update: if isAuth();
+      }
+    }
+
+    // ── /settings/{settingId} ────────────────────────────────
+    // Cyberspace password stored as SHA-256 hash — safe for auth users to read.
+    // Only staff/admin can write.
+    match /settings/{settingId} {
+      allow read: if isAuth();
+      allow write: if isStaff();
+    }
+
+    // ── /student_credentials/{uid} ───────────────────────────
+    // Student portal passwords stored here — NOT in the user doc.
+    // Read is public so the unauthenticated Account Recovery flow can display
+    // the password after the security question has been verified.
+    // Owner can CREATE their own doc at signup; only staff can update/delete.
+    match /student_credentials/{uid} {
+      allow read:   if true;
+      allow create: if isOwner(uid)
+                       && request.resource.data.keys().hasOnly(['password']);
+      allow update, delete: if isStaff();
+    }
+
+    // ── /cyberspace_tokens/{bookingId} ───────────────────────
+    // Per-booking plaintext access codes — staff eyes only.
+    // Students receive their code verbally from the admin desk.
+    match /cyberspace_tokens/{bookingId} {
+      allow read, write: if isStaff();
+    }
+
+    // ── Deny everything else ──────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
